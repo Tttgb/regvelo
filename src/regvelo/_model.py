@@ -158,6 +158,12 @@ class REGVELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         alpha_1_unconstr = alpha_1_unconstr[target_index]
         alpha_unconstr = alpha_unconstr[target_index]
 
+        ## Hill-type half-saturation constant K_j = median_i(s_ij) over all cells.
+        ## The regulator input to the GRN is saturated as s / (K + s) instead of raw s.
+        spliced_np = spliced.toarray() if hasattr(spliced, "toarray") else np.asarray(spliced)
+        hill_K = np.median(spliced_np, axis=0)
+        hill_K = np.maximum(hill_K, 1e-8)
+
         if W is None:
             W = torch.zeros([len(adata.var.index.values),len(adata.var.index.values)])
         
@@ -192,6 +198,7 @@ class REGVELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             alpha_unconstr_init = alpha_unconstr,
             alpha_1_unconstr_init = alpha_1_unconstr,
             soft_constraint = soft_constraint,
+            hill_K = hill_K,
             **model_kwargs,
         )
         self._model_summary_string = (

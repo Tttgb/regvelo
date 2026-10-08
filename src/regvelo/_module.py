@@ -144,18 +144,48 @@ class velocity_encoder(nn.Module):
         Whether to include a learnable base transcription rate (bias term).
     n_int
         Number of input genes
+    hill_K
+        Per-gene half-saturation constant ``K_j`` (median spliced expression).
+        The regulator input is saturated as ``s / (K + s)`` before the GRN map.
     """                 
     def __init__(
         self,
         activate: str = "softplus",
         base_alpha: bool = True,
         n_int: int = 5,
+        hill_K: np.ndarray = None,
         ):
         super().__init__()
         self.n_int = n_int
         self.fc1 = nn.Linear(n_int, n_int)
         self.activate = activate
         self.base_alpha = base_alpha
+        # Per-gene half-saturation constant K_j = median_i(s_ij), fixed (non-trainable).
+        # GRN input becomes s / (K + s) instead of raw s (Hill-type saturation), i.e.
+        # alpha_ig = softplus(b_g + sum_j W_gj * s_ij / (K_j + s_ij)).
+        if hill_K is None:
+            hill_K = np.ones(n_int)
+        self.register_buffer(
+            "hill_K", torch.as_tensor(hill_K, dtype=torch.float32).reshape(-1)
+        )
+
+    def _saturate(self, s: torch.Tensor) -> torch.Tensor:
+        r"""Hill-type saturation transform of the regulator expression profile.
+
+        .. math::
+            \tilde{s}_{ij} = \frac{s_{ij}}{K_j + s_{ij}}, \quad
+            K_j = \operatorname{median}_i(s_{ij})
+
+        Parameters
+        ----------
+        s
+            Expression tensor of shape ``(batch_size, n_int)``.
+
+        Returns
+        -------
+        Saturated expression tensor of the same shape.
+        """
+        return s / (self.hill_K + s)
         
     def _set_mask_grad(self):
         self.hooks = []
@@ -181,6 +211,7 @@ class velocity_encoder(nn.Module):
         """
         
         if self.activate is not "OR":
+            s = self._saturate(s)
             if self.base_alpha is not True:
                 grn = self.fc1.weight
                 #grn = grn - self.lamb_I
@@ -216,6 +247,7 @@ class velocity_encoder(nn.Module):
         Jacobian-like tensor of shape ``(batch_size, n_genes, n_genes)``.
         """
 
+        s = self._saturate(s)
         if self.base_alpha is not True:
             grn = self.fc1.weight
             alpha_unconstr = torch.matmul(s,grn.T)
@@ -248,12 +280,13 @@ class velocity_encoder(nn.Module):
         Transcription rate tensor of shape ``(batch_size, n_int)``.
         """
         if self.activate is not "OR":
+            s_in = self._saturate(s)
             if self.base_alpha is not True:
                 grn = self.fc1.weight
                 #grn = grn - self.lamb_I
-                alpha_unconstr = torch.matmul(s,grn.T)
+                alpha_unconstr = torch.matmul(s_in,grn.T)
             else:
-                alpha_unconstr = self.fc1(s)
+                alpha_unconstr = self.fc1(s_in)
 
             if self.activate == "softplus":
                 alpha = torch.clamp(F.softplus(alpha_unconstr),0,50)
@@ -293,11 +326,12 @@ class velocity_encoder(nn.Module):
         beta = torch.clamp(F.softplus(self.beta_mean_unconstr), 0, 50)
         gamma = torch.clamp(F.softplus(self.gamma_mean_unconstr), 0, 50)
         if self.activate is not "OR":
+            s_in = self._saturate(s)
             if self.base_alpha is not True:
                 grn = self.fc1.weight
-                alpha_unconstr = torch.matmul(s,grn.T)
+                alpha_unconstr = torch.matmul(s_in,grn.T)
             else:
-                alpha_unconstr = self.fc1(s)
+                alpha_unconstr = self.fc1(s_in)
 
             if self.activate == "softplus":
                 alpha = torch.clamp(F.softplus(alpha_unconstr),0,50)
@@ -369,6 +403,9 @@ class VELOVAE(BaseModuleClass):
     ----------
     n_input
         Number of input genes.
+    hill_K
+        Per-gene half-saturation constant ``K_j`` (median spliced expression over
+        cells). The regulator input is saturated as ``s / (K + s)`` before the GRN.
     regulator_index
         Boolean list indicating which genes are regulators.
     target_index
@@ -464,6 +501,7 @@ class VELOVAE(BaseModuleClass):
         linear_decoder: bool = False,
         soft_constraint: bool = True,
         auto_regulation: bool = False,
+        hill_K: np.ndarray = None,
         ):
         super().__init__()
         self.n_latent = n_latent
@@ -557,7 +595,7 @@ class VELOVAE(BaseModuleClass):
         )
         
         # define velocity encoder, define velocity vector for target genes
-        self.v_encoder = velocity_encoder(n_int = n_targets,activate = activate,base_alpha = base_alpha)
+        self.v_encoder = velocity_encoder(n_int = n_targets,activate = activate,base_alpha = base_alpha, hill_K = hill_K)
         self.v_encoder.fc1.weight = torch.nn.Parameter(0 * torch.ones(self.v_encoder.fc1.weight.shape))
         # saved kinetic parameter in velocity encoder module
         self.v_encoder.regulator_index = self.regulator_index
