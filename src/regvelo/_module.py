@@ -165,9 +165,10 @@ class velocity_encoder(nn.Module):
         # alpha_ig = softplus(b_g + sum_j W_gj * s_ij / (K_j + s_ij)).
         if hill_K is None:
             hill_K = np.ones(n_int)
-        self.register_buffer(
-            "hill_K", torch.as_tensor(hill_K, dtype=torch.float32).reshape(-1)
-        )
+        hill_K = torch.as_tensor(hill_K, dtype=torch.float32).reshape(-1)
+        if hill_K.numel() != n_int or not torch.all(torch.isfinite(hill_K) & (hill_K > 0)):
+            raise ValueError("hill_K must contain one finite, positive value per input gene.")
+        self.register_buffer("hill_K", hill_K)
 
     def _saturate(self, s: torch.Tensor) -> torch.Tensor:
         r"""Hill-type saturation transform of the regulator expression profile.
@@ -196,46 +197,55 @@ class velocity_encoder(nn.Module):
         w_grn = self.fc1.weight.register_hook(_hook_mask_no_regulator)
         self.hooks.append(w_grn)
 
+    def _jacobian_factors(self, s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return d(alpha)/d(z) and d(s/(K+s))/d(s) at the original expression s."""
+        saturated_s = self._saturate(s)
+        if self.base_alpha:
+            alpha_unconstr = self.fc1(saturated_s)
+        else:
+            alpha_unconstr = F.linear(saturated_s, self.fc1.weight)
+
+        if self.activate == "softplus":
+            alpha_grad = torch.sigmoid(alpha_unconstr)
+            # transcription_rate clamps softplus to 50.
+            alpha_grad = alpha_grad * (F.softplus(alpha_unconstr) < 50).to(alpha_grad.dtype)
+        elif self.activate == "sigmoid":
+            sig = torch.sigmoid(alpha_unconstr)
+            alpha_grad = sig * (1 - sig) * self.alpha_unconstr_max
+        else:
+            raise NotImplementedError(f"Jacobian for activation {self.activate!r} is not implemented.")
+
+        saturation_grad = self.hill_K / (self.hill_K + s).square()
+        return alpha_grad, saturation_grad
+
     ## TODO: regularizing the jacobian
     def GRN_Jacobian(self, s: torch.Tensor) -> torch.Tensor:
-        r"""Calculate the Jacobian of the GRN with respect to the input s.
+        r"""Calculate the mean GRN Jacobian with respect to the original input s.
         
         Parameters
         ----------
         s
-            Input tensor representing the state of the system, shape (batch_size, n_int).
+            Input state, shape ``(n_int,)`` or ``(batch_size, n_int)``.
         
         Returns
         -------
-        A Jacobian-like matrix capturing sensitivity of the transcription rate to each input gene.
+        Matrix of transcription-rate sensitivities to each input gene.
         """
-        
-        if self.activate is not "OR":
-            s = self._saturate(s)
-            if self.base_alpha is not True:
-                grn = self.fc1.weight
-                #grn = grn - self.lamb_I
-                alpha_unconstr = torch.matmul(s,grn.T)
-            else:
-                alpha_unconstr = self.fc1(s)
-
-            if self.activate == "softplus":    
-                coef = (torch.sigmoid(alpha_unconstr))
-            if self.activate == "sigmoid":
-                coef = (torch.sigmoid(alpha_unconstr))*(1 - torch.sigmoid(alpha_unconstr))*self.alpha_unconstr_max
-        else:
+        if self.activate == "OR":
+            # Preserve the existing OR-mode Jacobian; this mode does not use Hill saturation.
             coef = (1 / (torch.nn.functional.softsign(s) + 1)) * (1 / (1 + torch.abs(s - 0.5))**2) * torch.exp(self.fc1(torch.log(torch.nn.functional.softsign(s - 0.5)+1)))
+            if coef.dim() > 1:
+                coef = coef.mean(0)
+            return torch.diag(coef) @ self.fc1.weight
 
-        if coef.dim() > 1:
-            coef = coef.mean(0)
-        Jaco_m = torch.matmul(torch.diag(coef), self.fc1.weight)
-            
-        
-        return Jaco_m
+        if s.dim() == 1:
+            s = s.unsqueeze(0)
+        alpha_grad, saturation_grad = self._jacobian_factors(s)
+        # Average the full per-cell Jacobian, including the Hill derivative.
+        return self.fc1.weight * (alpha_grad.T @ saturation_grad) / s.shape[0]
     
     def GRN_Jacobian2(self, s: torch.Tensor) -> torch.Tensor:
-        r"""Computes the per-sample Jacobian-like matrices for the transcription rate 
-        with respect to input `s`, for all samples in the batch.
+        r"""Compute each cell's transcription-rate Jacobian with respect to its input s.
     
         Parameters
         ----------
@@ -244,28 +254,10 @@ class velocity_encoder(nn.Module):
 
         Returns
         -------
-        Jacobian-like tensor of shape ``(batch_size, n_genes, n_genes)``.
+        Jacobian tensor of shape ``(batch_size, n_genes, n_genes)``.
         """
-
-        s = self._saturate(s)
-        if self.base_alpha is not True:
-            grn = self.fc1.weight
-            alpha_unconstr = torch.matmul(s,grn.T)
-        else:
-            alpha_unconstr = self.fc1(s)
-            
-        if self.activate == "softplus":    
-            coef = (torch.sigmoid(alpha_unconstr))
-        if self.activate == "sigmoid":
-            coef = (torch.sigmoid(alpha_unconstr))*(1 - torch.sigmoid(alpha_unconstr))*self.alpha_unconstr_max
-        
-        # Perform element-wise multiplication
-        Jaco = coef.unsqueeze(-1) * self.fc1.weight.unsqueeze(0)
-
-        # Transpose and reshape to get the final 3D tensor with dimensions (m, n, n)
-        Jaco = Jaco.reshape(s.shape[0], s.shape[1], s.shape[1])
-        
-        return Jaco
+        alpha_grad, saturation_grad = self._jacobian_factors(s)
+        return alpha_grad.unsqueeze(-1) * self.fc1.weight.unsqueeze(0) * saturation_grad.unsqueeze(1)
     
     def transcription_rate(self, s: torch.Tensor) -> torch.Tensor:
         r"""Compute transcription rate.

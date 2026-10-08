@@ -162,6 +162,15 @@ class REGVELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         ## The regulator input to the GRN is saturated as s / (K + s) instead of raw s.
         spliced_np = spliced.toarray() if hasattr(spliced, "toarray") else np.asarray(spliced)
         hill_K = np.median(spliced_np, axis=0)
+        n_zero_median = np.count_nonzero(hill_K <= 0)
+        if n_zero_median:
+            warnings.warn(
+                f"{n_zero_median} genes have non-positive median spliced expression. "
+                "Using K=1e-8 for these genes makes their Hill input nearly binary "
+                "and may cause large expression sensitivities; consider filtering them.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         hill_K = np.maximum(hill_K, 1e-8)
 
         if W is None:
